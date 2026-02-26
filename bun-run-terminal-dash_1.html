@@ -1,0 +1,915 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>Bun Run: Terminal Dash</title>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=Press+Start+2P&display=swap');
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    background: #0a0a14;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    min-height: 100vh;
+    font-family: 'Press Start 2P', monospace;
+    overflow: hidden;
+    touch-action: none;
+    user-select: none;
+    -webkit-user-select: none;
+  }
+  canvas {
+    image-rendering: pixelated;
+    image-rendering: crisp-edges;
+    display: block;
+  }
+</style>
+</head>
+<body>
+<canvas id="game"></canvas>
+<script>
+const canvas = document.getElementById('game');
+const ctx = canvas.getContext('2d');
+
+// ── RESPONSIVE SIZE ──
+const COLS = 9;
+const TILE = Math.min(Math.floor(window.innerWidth / COLS), 64);
+const VISIBLE_ROWS = Math.ceil(window.innerHeight / TILE) + 2;
+canvas.width = COLS * TILE;
+canvas.height = window.innerHeight;
+
+// ── GAME CONFIG ──
+const TOTAL_ROWS = 60;
+const GATE_ROW = TOTAL_ROWS - 2;
+const HOP_DURATION = 8;
+const DEATH_ANIM = 50;
+
+// ── LANE TYPES ──
+const LANE_FLOOR = 0;
+const LANE_BELT = 1;       // suitcase conveyor (danger!)
+const LANE_SEATS = 2;      // safe - has seated passengers
+const LANE_WALKWAY = 3;    // safe walkway
+const LANE_GATE = 4;       // goal
+const LANE_SECURITY = 5;   // safe checkpoint row
+const LANE_START = 6;
+
+// ── COLORS ──
+const PALETTE = {
+  floor: ['#c0c0cc', '#b8b8c8'],
+  belt: ['#5a6a78', '#526272'],
+  beltRail: '#404a54',
+  beltLine: '#6a7a88',
+  seats: ['#3a5a8a', '#3a5a8a'],
+  seatRow: '#9898a8',
+  walkway: ['#aab0b8', '#a4aab2'],
+  gate: '#2a8a5a',
+  gateGlow: '#44dd88',
+  security: ['#b0a898', '#a8a090'],
+  start: ['#a8a8b8', '#a0a0b0'],
+  wall: '#2a2a40',
+};
+
+// ── GENERATE LANES ──
+let lanes = [];
+function generateLanes() {
+  lanes = [];
+  for (let i = 0; i < TOTAL_ROWS; i++) {
+    if (i === 0) {
+      lanes.push(createLane(i, LANE_START));
+    } else if (i >= GATE_ROW) {
+      lanes.push(createLane(i, LANE_GATE));
+    } else {
+      // Pattern: safe, danger, safe, danger... with variation
+      const section = Math.floor((i - 1) / 3);
+      const pos = (i - 1) % 3;
+
+      if (pos === 0) {
+        // Safe row
+        lanes.push(createLane(i, Math.random() > 0.5 ? LANE_SEATS : LANE_WALKWAY));
+      } else if (pos === 1) {
+        // Danger: belt with suitcases
+        lanes.push(createLane(i, LANE_BELT));
+      } else {
+        // Mix
+        if (i % 7 === 0) lanes.push(createLane(i, LANE_SECURITY));
+        else if (Math.random() > 0.45) lanes.push(createLane(i, LANE_BELT));
+        else lanes.push(createLane(i, LANE_SEATS));
+      }
+    }
+  }
+}
+
+function createLane(row, type) {
+  const lane = {
+    row,
+    type,
+    suitcases: [],
+    passengers: [],
+    speed: 0,
+    dir: 1,
+  };
+
+  if (type === LANE_BELT) {
+    // Suitcases moving across
+    const difficulty = Math.min(1, row / TOTAL_ROWS);
+    lane.speed = (0.8 + Math.random() * 1.5 + difficulty * 1.2) * TILE / 60;
+    lane.dir = (row % 2 === 0) ? 1 : -1;
+    const count = 2 + Math.floor(Math.random() * 2 + difficulty);
+    const gap = (COLS * TILE) / count;
+    for (let i = 0; i < count; i++) {
+      lane.suitcases.push({
+        x: i * gap + Math.random() * gap * 0.4,
+        w: TILE * (0.8 + Math.random() * 0.6),
+        h: TILE * 0.55,
+        color: ['#cc4444','#4488cc','#44aa66','#cc8833','#aa44aa','#dd6688','#5588bb'][Math.floor(Math.random()*7)],
+        accent: ['#eebb44','#44ddaa','#ff6688','#88ccff','#ffaa44'][Math.floor(Math.random()*5)],
+        type: Math.random() > 0.3 ? 'suitcase' : 'cart',
+      });
+    }
+  }
+
+  if (type === LANE_SEATS || type === LANE_WALKWAY || type === LANE_SECURITY) {
+    // Seated/standing passengers as scenery
+    const count = Math.floor(Math.random() * 3) + 1;
+    const positions = [];
+    for (let i = 0; i < count; i++) {
+      let col;
+      do { col = Math.floor(Math.random() * COLS); }
+      while (positions.includes(col));
+      positions.push(col);
+      lane.passengers.push({
+        col,
+        color: ['#e06060','#60a0e0','#e0a040','#a060c0','#60c080','#d07090','#8080d0','#e08060'][Math.floor(Math.random()*8)],
+        hair: ['#2a1a10','#8a6a40','#1a1a2a','#aa6633','#dda050'][Math.floor(Math.random()*5)],
+        seated: type === LANE_SEATS,
+        hasPhone: Math.random() > 0.5,
+      });
+    }
+  }
+
+  return lane;
+}
+
+// ── PLAYER STATE ──
+let player = {
+  col: Math.floor(COLS / 2),
+  row: 0,
+  x: 0, y: 0,        // rendered position (pixel)
+  targetX: 0, targetY: 0,
+  hopTimer: 0,
+  hopFromX: 0, hopFromY: 0,
+  dir: 0,             // 0=up, 1=left, 2=down, 3=right
+  alive: true,
+  deathTimer: 0,
+  squish: 0,
+  maxRow: 0,
+  score: 0,
+};
+
+let gameState = 'title'; // title, playing, dead, win
+let camY = 0;
+let targetCamY = 0;
+let gameTime = 0;
+let highScore = 0;
+let screenShake = 0;
+let particles = [];
+let flashAlpha = 0;
+
+function resetPlayer() {
+  player.col = Math.floor(COLS / 2);
+  player.row = 0;
+  player.x = player.col * TILE;
+  player.y = rowToScreen(0);
+  player.targetX = player.x;
+  player.targetY = player.y;
+  player.hopTimer = 0;
+  player.alive = true;
+  player.deathTimer = 0;
+  player.squish = 0;
+  player.maxRow = 0;
+  player.score = 0;
+  player.dir = 0;
+  camY = 0;
+  targetCamY = 0;
+  gameTime = 0;
+  particles = [];
+}
+
+function rowToWorld(row) {
+  return (TOTAL_ROWS - row) * TILE;
+}
+
+function rowToScreen(row) {
+  return rowToWorld(row) - camY;
+}
+
+// ── MOVEMENT ──
+function tryHop(dCol, dRow) {
+  if (!player.alive || player.hopTimer > 0) return;
+  if (gameState !== 'playing') return;
+
+  const newCol = player.col + dCol;
+  const newRow = player.row + dRow;
+
+  if (newCol < 0 || newCol >= COLS) return;
+  if (newRow < 0 || newRow > GATE_ROW + 1) return;
+
+  // Check if passenger is blocking
+  if (newRow < lanes.length) {
+    const lane = lanes[newRow];
+    for (const p of lane.passengers) {
+      if (p.col === newCol) return; // blocked!
+    }
+  }
+
+  player.hopFromX = player.x;
+  player.hopFromY = player.y;
+  player.col = newCol;
+  player.row = newRow;
+  player.targetX = newCol * TILE;
+  player.targetY = rowToWorld(newRow);
+  player.hopTimer = HOP_DURATION;
+
+  if (dRow > 0) player.dir = 0;
+  else if (dRow < 0) player.dir = 2;
+  else if (dCol < 0) player.dir = 1;
+  else if (dCol > 0) player.dir = 3;
+
+  if (newRow > player.maxRow) {
+    player.score += (newRow - player.maxRow);
+    player.maxRow = newRow;
+  }
+
+  // Hop particles
+  for (let i = 0; i < 4; i++) {
+    particles.push({
+      x: player.x + TILE/2 + (Math.random()-0.5)*10,
+      y: rowToWorld(player.row - dRow) + TILE*0.8,
+      vx: (Math.random()-0.5)*2,
+      vy: Math.random()*-1,
+      life: 0.7,
+      color: '#d0d0dd',
+      size: 2 + Math.random()*2,
+    });
+  }
+}
+
+// ── INPUT ──
+let touchStartX = 0, touchStartY = 0;
+const SWIPE_THRESHOLD = 20;
+
+document.addEventListener('keydown', e => {
+  if (gameState === 'title') { startGame(); return; }
+  if (gameState === 'dead' && player.deathTimer > DEATH_ANIM) { startGame(); return; }
+  if (gameState === 'win') { startGame(); return; }
+
+  switch(e.key) {
+    case 'ArrowUp': case 'w': case 'W': tryHop(0, 1); break;
+    case 'ArrowDown': case 's': case 'S': tryHop(0, -1); break;
+    case 'ArrowLeft': case 'a': case 'A': tryHop(-1, 0); break;
+    case 'ArrowRight': case 'd': case 'D': tryHop(1, 0); break;
+  }
+  e.preventDefault();
+});
+
+canvas.addEventListener('touchstart', e => {
+  e.preventDefault();
+  if (gameState === 'title') { startGame(); return; }
+  if (gameState === 'dead' && player.deathTimer > DEATH_ANIM) { startGame(); return; }
+  if (gameState === 'win') { startGame(); return; }
+  touchStartX = e.touches[0].clientX;
+  touchStartY = e.touches[0].clientY;
+});
+
+canvas.addEventListener('touchend', e => {
+  e.preventDefault();
+  if (gameState !== 'playing') return;
+  const dx = e.changedTouches[0].clientX - touchStartX;
+  const dy = e.changedTouches[0].clientY - touchStartY;
+  const adx = Math.abs(dx), ady = Math.abs(dy);
+
+  if (adx < SWIPE_THRESHOLD && ady < SWIPE_THRESHOLD) {
+    // Tap = hop forward
+    tryHop(0, 1);
+  } else if (adx > ady) {
+    tryHop(dx > 0 ? 1 : -1, 0);
+  } else {
+    tryHop(0, dy < 0 ? 1 : -1);
+  }
+});
+
+canvas.addEventListener('click', e => {
+  if (gameState === 'title') { startGame(); return; }
+  if (gameState === 'dead' && player.deathTimer > DEATH_ANIM) { startGame(); return; }
+  if (gameState === 'win') { startGame(); return; }
+});
+
+// ── GAME LOGIC ──
+function startGame() {
+  generateLanes();
+  resetPlayer();
+  gameState = 'playing';
+}
+
+function killPlayer() {
+  if (!player.alive) return;
+  player.alive = false;
+  player.deathTimer = 0;
+  screenShake = 12;
+  flashAlpha = 0.6;
+
+  // Death particles
+  for (let i = 0; i < 20; i++) {
+    const angle = (Math.PI * 2 / 20) * i;
+    particles.push({
+      x: player.x + TILE/2,
+      y: rowToWorld(player.row) + TILE/2,
+      vx: Math.cos(angle) * (2 + Math.random()*2),
+      vy: Math.sin(angle) * (2 + Math.random()*2),
+      life: 1,
+      color: ['#e8b860','#d4a050','#f0d888','#c09040'][Math.floor(Math.random()*4)],
+      size: 3 + Math.random()*3,
+    });
+  }
+
+  if (player.score > highScore) highScore = player.score;
+  gameState = 'dead';
+}
+
+function winGame() {
+  gameState = 'win';
+  if (player.score > highScore) highScore = player.score;
+  // Confetti
+  for (let i = 0; i < 50; i++) {
+    particles.push({
+      x: player.x + TILE/2 + (Math.random()-0.5)*100,
+      y: rowToWorld(player.row) + (Math.random()-0.5)*60,
+      vx: (Math.random()-0.5)*4,
+      vy: -Math.random()*5 - 2,
+      life: 1.5,
+      color: ['#ffd866','#66ffa8','#ff6688','#66aaff','#ff44aa','#44ffcc'][Math.floor(Math.random()*6)],
+      size: 3 + Math.random()*4,
+      gravity: 0.08,
+    });
+  }
+}
+
+// ── UPDATE ──
+function update() {
+  gameTime++;
+
+  // Update particles
+  for (let i = particles.length - 1; i >= 0; i--) {
+    const p = particles[i];
+    p.x += p.vx;
+    p.y += p.vy;
+    if (p.gravity) p.vy += p.gravity;
+    p.life -= 0.018;
+    if (p.life <= 0) particles.splice(i, 1);
+  }
+
+  if (screenShake > 0) screenShake *= 0.85;
+  if (flashAlpha > 0) flashAlpha *= 0.9;
+
+  if (gameState !== 'playing') return;
+
+  // Move suitcases
+  for (const lane of lanes) {
+    if (lane.type !== LANE_BELT) continue;
+    for (const s of lane.suitcases) {
+      s.x += lane.speed * lane.dir;
+      const totalW = COLS * TILE + s.w * 2;
+      if (lane.dir > 0 && s.x > COLS * TILE + s.w) s.x = -s.w;
+      if (lane.dir < 0 && s.x < -s.w) s.x = COLS * TILE + s.w;
+    }
+  }
+
+  // Hop interpolation
+  if (player.hopTimer > 0) {
+    player.hopTimer--;
+    const t = 1 - player.hopTimer / HOP_DURATION;
+    const ease = t < 0.5 ? 2*t*t : 1 - Math.pow(-2*t+2, 2)/2;
+    player.x = player.hopFromX + (player.targetX - player.hopFromX) * ease;
+    player.y = player.hopFromY + (player.targetY - player.hopFromY) * ease;
+  } else {
+    player.x = player.targetX;
+    player.y = player.targetY;
+  }
+
+  // Camera
+  targetCamY = rowToWorld(player.row) - canvas.height * 0.6;
+  camY += (targetCamY - camY) * 0.12;
+
+  // Collision with suitcases
+  if (player.alive && player.row < lanes.length) {
+    const lane = lanes[player.row];
+    if (lane.type === LANE_BELT) {
+      const px = player.x + TILE * 0.2;
+      const pw = TILE * 0.6;
+      const py = rowToWorld(player.row) + TILE * 0.2;
+      const ph = TILE * 0.6;
+      for (const s of lane.suitcases) {
+        const sx = s.x - s.w/2;
+        if (px < sx + s.w && px + pw > sx && py < py + s.h && py + ph > py) {
+          // Better box check
+          if (px + pw > sx && px < sx + s.w) {
+            killPlayer();
+          }
+        }
+      }
+    }
+  }
+
+  // Win check
+  if (player.alive && player.row >= GATE_ROW) {
+    winGame();
+  }
+}
+
+// ── DRAWING ──
+function drawLane(lane) {
+  const sy = rowToWorld(lane.row) - camY;
+  if (sy > canvas.height + TILE || sy < -TILE * 2) return;
+
+  const t = lane.type;
+  const parity = lane.row % 2;
+
+  // Background
+  switch (t) {
+    case LANE_FLOOR:
+    case LANE_START:
+      ctx.fillStyle = PALETTE.floor[parity];
+      ctx.fillRect(0, sy, canvas.width, TILE);
+      // tile lines
+      ctx.fillStyle = 'rgba(0,0,0,0.04)';
+      for (let x = 0; x < COLS; x++) {
+        ctx.fillRect(x * TILE, sy, 1, TILE);
+      }
+      break;
+
+    case LANE_BELT:
+      ctx.fillStyle = PALETTE.belt[parity];
+      ctx.fillRect(0, sy, canvas.width, TILE);
+      // Conveyor lines
+      const offset = (gameTime * lane.speed * lane.dir * 0.5) % 20;
+      ctx.fillStyle = PALETTE.beltLine;
+      for (let lx = -20; lx < canvas.width + 20; lx += 20) {
+        ctx.fillRect(lx + offset, sy + TILE/2 - 1, 10, 2);
+      }
+      // Rails
+      ctx.fillStyle = PALETTE.beltRail;
+      ctx.fillRect(0, sy, canvas.width, 3);
+      ctx.fillRect(0, sy + TILE - 3, canvas.width, 3);
+      // Arrow indicators
+      ctx.fillStyle = 'rgba(255,255,255,0.08)';
+      const arrowChar = lane.dir > 0 ? '►' : '◄';
+      ctx.font = `${TILE*0.3}px "Press Start 2P"`;
+      for (let ax = 0; ax < COLS; ax += 2) {
+        ctx.fillText(arrowChar, ax * TILE + TILE*0.3, sy + TILE*0.65);
+      }
+      break;
+
+    case LANE_SEATS:
+      ctx.fillStyle = PALETTE.seatRow;
+      ctx.fillRect(0, sy, canvas.width, TILE);
+      ctx.fillStyle = 'rgba(0,0,0,0.04)';
+      for (let x = 0; x < COLS; x++) ctx.fillRect(x * TILE, sy, 1, TILE);
+      break;
+
+    case LANE_WALKWAY:
+      ctx.fillStyle = PALETTE.walkway[parity];
+      ctx.fillRect(0, sy, canvas.width, TILE);
+      // dotted center line
+      ctx.fillStyle = 'rgba(0,0,0,0.06)';
+      for (let dx = 0; dx < canvas.width; dx += 16) {
+        ctx.fillRect(dx, sy + TILE/2, 8, 2);
+      }
+      break;
+
+    case LANE_SECURITY:
+      ctx.fillStyle = PALETTE.security[parity];
+      ctx.fillRect(0, sy, canvas.width, TILE);
+      // scanner arches
+      ctx.fillStyle = 'rgba(60,60,100,0.2)';
+      ctx.fillRect(TILE*2, sy, TILE*0.15, TILE);
+      ctx.fillRect(TILE*2 + TILE*0.85, sy, TILE*0.15, TILE);
+      ctx.fillRect(TILE*6, sy, TILE*0.15, TILE);
+      ctx.fillRect(TILE*6 + TILE*0.85, sy, TILE*0.15, TILE);
+      break;
+
+    case LANE_GATE:
+      ctx.fillStyle = PALETTE.gate;
+      ctx.fillRect(0, sy, canvas.width, TILE);
+      const glow = Math.sin(gameTime * 0.06) * 0.15 + 0.85;
+      ctx.fillStyle = `rgba(68, 221, 136, ${glow * 0.25})`;
+      ctx.fillRect(0, sy, canvas.width, TILE);
+      if (lane.row === GATE_ROW) {
+        // Gate sign
+        ctx.fillStyle = '#1a3a2a';
+        ctx.fillRect(COLS*TILE/2 - TILE*1.5, sy + 4, TILE*3, TILE - 8);
+        ctx.fillStyle = PALETTE.gateGlow;
+        ctx.font = `${TILE*0.35}px "Press Start 2P"`;
+        ctx.textAlign = 'center';
+        ctx.fillText('GATE B7', COLS*TILE/2, sy + TILE*0.55);
+        // Blinking
+        if (Math.sin(gameTime * 0.08) > 0) {
+          ctx.font = `${TILE*0.2}px "Press Start 2P"`;
+          ctx.fillText('✈ NOW BOARDING ✈', COLS*TILE/2, sy + TILE*0.82);
+        }
+        ctx.textAlign = 'left';
+      }
+      break;
+  }
+
+  // Draw passengers (obstacles you can't walk through)
+  for (const p of lane.passengers) {
+    drawPassenger(p, sy);
+  }
+
+  // Draw suitcases
+  for (const s of lane.suitcases) {
+    drawSuitcase(s, sy);
+  }
+}
+
+function drawSuitcase(s, laneY) {
+  const sx = s.x - s.w/2;
+  const sy = laneY + (TILE - s.h) / 2;
+
+  if (s.type === 'cart') {
+    // Luggage cart
+    ctx.fillStyle = '#778899';
+    ctx.fillRect(sx + 2, sy + 2, s.w - 4, s.h - 4);
+    ctx.fillStyle = '#667788';
+    ctx.fillRect(sx + 4, sy, s.w - 8, 4);
+    // Handle
+    ctx.fillStyle = '#556677';
+    ctx.fillRect(sx, sy + s.h*0.3, 4, s.h*0.4);
+    // Stacked luggage
+    ctx.fillStyle = s.color;
+    ctx.fillRect(sx + 6, sy + 4, s.w*0.4, s.h - 10);
+    ctx.fillStyle = s.accent;
+    ctx.fillRect(sx + s.w*0.5, sy + 6, s.w*0.3, s.h - 14);
+    // Wheels
+    ctx.fillStyle = '#333';
+    ctx.fillRect(sx + 4, sy + s.h - 4, 5, 4);
+    ctx.fillRect(sx + s.w - 10, sy + s.h - 4, 5, 4);
+  } else {
+    // Suitcase
+    ctx.fillStyle = s.color;
+    ctx.fillRect(sx + 2, sy + 2, s.w - 4, s.h - 4);
+    // Highlight
+    ctx.fillStyle = 'rgba(255,255,255,0.2)';
+    ctx.fillRect(sx + 4, sy + 3, s.w - 8, 4);
+    // Handle
+    ctx.fillStyle = 'rgba(0,0,0,0.3)';
+    ctx.fillRect(sx + s.w/2 - 6, sy, 12, 3);
+    // Stripe
+    ctx.fillStyle = s.accent;
+    ctx.fillRect(sx + 4, sy + s.h*0.45, s.w - 8, 4);
+    // Wheels
+    ctx.fillStyle = '#222';
+    ctx.fillRect(sx + 5, sy + s.h - 3, 4, 3);
+    ctx.fillRect(sx + s.w - 10, sy + s.h - 3, 4, 3);
+    // Tag
+    ctx.fillStyle = '#fff';
+    ctx.fillRect(sx + s.w - 8, sy + 6, 5, 7);
+  }
+
+  // Shadow underneath
+  ctx.fillStyle = 'rgba(0,0,0,0.1)';
+  ctx.fillRect(sx + 4, sy + s.h, s.w - 8, 3);
+}
+
+function drawPassenger(p, laneY) {
+  const px = p.col * TILE + TILE * 0.15;
+  const py = laneY + TILE * 0.1;
+  const pw = TILE * 0.7;
+  const ph = TILE * 0.8;
+
+  if (p.seated) {
+    // Chair
+    ctx.fillStyle = '#4a6a9a';
+    ctx.fillRect(px - 1, py + ph*0.3, pw + 2, ph*0.7);
+    ctx.fillStyle = '#3a5a88';
+    ctx.fillRect(px, py + ph*0.15, pw, ph*0.2);
+  }
+
+  // Body
+  ctx.fillStyle = p.color;
+  ctx.fillRect(px + pw*0.15, py + ph*0.35, pw*0.7, ph*0.5);
+  // Head
+  ctx.fillStyle = '#f0d0b0';
+  ctx.fillRect(px + pw*0.25, py + ph*0.05, pw*0.5, pw*0.5);
+  // Hair
+  ctx.fillStyle = p.hair;
+  ctx.fillRect(px + pw*0.25, py + ph*0.02, pw*0.5, pw*0.2);
+  // Eyes
+  ctx.fillStyle = '#222';
+  ctx.fillRect(px + pw*0.32, py + ph*0.2, 2, 2);
+  ctx.fillRect(px + pw*0.55, py + ph*0.2, 2, 2);
+
+  // Phone
+  if (p.hasPhone) {
+    ctx.fillStyle = '#333';
+    ctx.fillRect(px + pw*0.65, py + ph*0.45, pw*0.2, pw*0.35);
+    ctx.fillStyle = '#aaddff';
+    ctx.fillRect(px + pw*0.67, py + ph*0.47, pw*0.16, pw*0.25);
+  }
+}
+
+function drawBun() {
+  const screenX = player.x - (screenShake > 0.5 ? (Math.random()-0.5)*screenShake : 0);
+  const screenY = player.y - camY - (screenShake > 0.5 ? (Math.random()-0.5)*screenShake : 0);
+
+  // Hop arc
+  let hopArc = 0;
+  if (player.hopTimer > 0) {
+    const t = 1 - player.hopTimer / HOP_DURATION;
+    hopArc = Math.sin(t * Math.PI) * TILE * 0.4;
+  }
+
+  const bx = screenX + TILE * 0.5;
+  const by = screenY + TILE * 0.5 - hopArc;
+  const S = TILE * 0.42; // half-size
+
+  if (!player.alive) {
+    // Death: flatten
+    const dt = Math.min(player.deathTimer / 15, 1);
+    ctx.save();
+    ctx.translate(bx, by + S);
+    ctx.scale(1 + dt * 0.8, 1 - dt * 0.7);
+    ctx.translate(-bx, -(by + S));
+  }
+
+  // Shadow
+  ctx.fillStyle = 'rgba(0,0,0,0.2)';
+  ctx.beginPath();
+  ctx.ellipse(bx, screenY + TILE * 0.85, S * 0.75, S * 0.3, 0, 0, Math.PI*2);
+  ctx.fill();
+
+  // Bottom bun
+  ctx.fillStyle = '#d4a050';
+  ctx.fillRect(bx - S, by + S*0.15, S*2, S*0.85);
+  ctx.fillRect(bx - S*0.8, by + S, S*1.6, S*0.15);
+
+  // Top bun
+  ctx.fillStyle = '#e8b860';
+  ctx.fillRect(bx - S, by - S*0.5, S*2, S*0.7);
+  ctx.fillRect(bx - S*0.8, by - S*0.85, S*1.6, S*0.45);
+  ctx.fillRect(bx - S*0.55, by - S, S*1.1, S*0.25);
+
+  // Sesame seeds
+  ctx.fillStyle = '#f0d888';
+  ctx.fillRect(bx - S*0.3, by - S*0.8, S*0.15, S*0.15);
+  ctx.fillRect(bx + S*0.2, by - S*0.65, S*0.15, S*0.15);
+  ctx.fillRect(bx - S*0.55, by - S*0.45, S*0.15, S*0.15);
+  ctx.fillRect(bx + S*0.4, by - S*0.4, S*0.15, S*0.15);
+
+  // Highlight
+  ctx.fillStyle = 'rgba(255,255,255,0.3)';
+  ctx.fillRect(bx - S*0.2, by - S*0.9, S*0.4, S*0.12);
+
+  // Blush
+  ctx.fillStyle = 'rgba(255, 120, 100, 0.35)';
+  ctx.fillRect(bx - S, by + S*0.05, S*0.25, S*0.2);
+  ctx.fillRect(bx + S*0.75, by + S*0.05, S*0.25, S*0.2);
+
+  // Eyes
+  if (player.alive) {
+    const ed = player.dir;
+    const ex = ed === 1 ? -S*0.12 : ed === 3 ? S*0.12 : 0;
+    const ey = ed === 0 ? -S*0.06 : ed === 2 ? S*0.06 : 0;
+    ctx.fillStyle = '#2a1a10';
+    ctx.fillRect(bx - S*0.35 + ex, by - S*0.05 + ey, S*0.18, S*0.22);
+    ctx.fillRect(bx + S*0.2 + ex, by - S*0.05 + ey, S*0.18, S*0.22);
+    // Eye shine
+    ctx.fillStyle = '#fff';
+    ctx.fillRect(bx - S*0.35 + ex, by - S*0.05 + ey, S*0.08, S*0.08);
+    ctx.fillRect(bx + S*0.2 + ex, by - S*0.05 + ey, S*0.08, S*0.08);
+    // Mouth
+    ctx.fillStyle = '#6a3a20';
+    ctx.fillRect(bx - S*0.08 + ex, by + S*0.35, S*0.22, S*0.08);
+  } else {
+    // Dead eyes X_X
+    ctx.fillStyle = '#2a1a10';
+    ctx.font = `${S*0.5}px "Press Start 2P"`;
+    ctx.textAlign = 'center';
+    ctx.fillText('x x', bx, by + S*0.15);
+    ctx.textAlign = 'left';
+  }
+
+  // Legs when hopping
+  if (player.hopTimer > 0 && player.alive) {
+    const lt = player.hopTimer / HOP_DURATION;
+    ctx.fillStyle = '#c09040';
+    ctx.fillRect(bx - S*0.4, by + S + S*0.1, S*0.25, S*0.3);
+    ctx.fillRect(bx + S*0.15, by + S + S*0.1, S*0.25, S*0.3);
+    // Shoes
+    ctx.fillStyle = '#8a5a30';
+    ctx.fillRect(bx - S*0.45, by + S + S*0.35, S*0.35, S*0.12);
+    ctx.fillRect(bx + S*0.12, by + S + S*0.35, S*0.35, S*0.12);
+  }
+
+  if (!player.alive) ctx.restore();
+}
+
+function drawUI() {
+  // Score
+  ctx.fillStyle = 'rgba(10,10,20,0.75)';
+  ctx.fillRect(8, 8, 120, 30);
+  ctx.strokeStyle = '#3a3a5a';
+  ctx.lineWidth = 2;
+  ctx.strokeRect(8, 8, 120, 30);
+  ctx.fillStyle = '#7a7a9a';
+  ctx.font = `${Math.max(7, TILE*0.14)}px "Press Start 2P"`;
+  ctx.fillText('ROWS', 16, 22);
+  ctx.fillStyle = '#ffd866';
+  ctx.font = `${Math.max(10, TILE*0.2)}px "Press Start 2P"`;
+  ctx.fillText(`${player.maxRow}/${GATE_ROW}`, 16, 34);
+
+  // High score
+  if (highScore > 0) {
+    ctx.fillStyle = 'rgba(10,10,20,0.75)';
+    ctx.fillRect(canvas.width - 88, 8, 80, 30);
+    ctx.strokeStyle = '#3a3a5a';
+    ctx.strokeRect(canvas.width - 88, 8, 80, 30);
+    ctx.fillStyle = '#5a5a7a';
+    ctx.font = `${Math.max(6, TILE*0.11)}px "Press Start 2P"`;
+    ctx.fillText('BEST', canvas.width - 80, 22);
+    ctx.fillStyle = '#66ffa8';
+    ctx.font = `${Math.max(9, TILE*0.17)}px "Press Start 2P"`;
+    ctx.fillText(`${highScore}`, canvas.width - 80, 34);
+  }
+}
+
+function drawTitle() {
+  ctx.fillStyle = 'rgba(8, 8, 16, 0.88)';
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+  const cx = canvas.width / 2;
+  const cy = canvas.height * 0.38;
+
+  // Draw a big bun
+  const S = TILE * 0.9;
+  const bob = Math.sin(gameTime * 0.04) * 4;
+
+  ctx.fillStyle = '#d4a050';
+  ctx.fillRect(cx - S, cy + S*0.15 + bob, S*2, S*0.85);
+  ctx.fillStyle = '#e8b860';
+  ctx.fillRect(cx - S, cy - S*0.5 + bob, S*2, S*0.7);
+  ctx.fillRect(cx - S*0.8, cy - S*0.85 + bob, S*1.6, S*0.45);
+  ctx.fillRect(cx - S*0.55, cy - S + bob, S*1.1, S*0.25);
+  ctx.fillStyle = '#f0d888';
+  ctx.fillRect(cx - S*0.3, cy - S*0.8 + bob, S*0.18, S*0.18);
+  ctx.fillRect(cx + S*0.2, cy - S*0.65 + bob, S*0.18, S*0.18);
+  ctx.fillRect(cx - S*0.55, cy - S*0.45 + bob, S*0.18, S*0.18);
+  ctx.fillStyle = 'rgba(255,255,255,0.3)';
+  ctx.fillRect(cx - S*0.2, cy - S*0.9 + bob, S*0.4, S*0.12);
+  ctx.fillStyle = 'rgba(255,120,100,0.35)';
+  ctx.fillRect(cx - S, cy + S*0.05 + bob, S*0.25, S*0.2);
+  ctx.fillRect(cx + S*0.75, cy + S*0.05 + bob, S*0.25, S*0.2);
+  ctx.fillStyle = '#2a1a10';
+  ctx.fillRect(cx - S*0.35, cy - S*0.05 + bob, S*0.2, S*0.25);
+  ctx.fillRect(cx + S*0.2, cy - S*0.05 + bob, S*0.2, S*0.25);
+  ctx.fillStyle = '#fff';
+  ctx.fillRect(cx - S*0.35, cy - S*0.05 + bob, S*0.09, S*0.09);
+  ctx.fillRect(cx + S*0.2, cy - S*0.05 + bob, S*0.09, S*0.09);
+  ctx.fillStyle = '#6a3a20';
+  ctx.fillRect(cx - S*0.08, cy + S*0.35 + bob, S*0.22, S*0.08);
+
+  // Title
+  ctx.textAlign = 'center';
+  ctx.fillStyle = '#ffd866';
+  ctx.font = `${Math.max(20, TILE*0.55)}px "Press Start 2P"`;
+  ctx.fillText('BUN RUN', cx, cy + S*1.6);
+
+  ctx.fillStyle = '#9a9aba';
+  ctx.font = `${Math.max(8, TILE*0.2)}px "Press Start 2P"`;
+  ctx.fillText('Terminal Dash', cx, cy + S*2);
+
+  // Blink prompt
+  if (Math.sin(gameTime * 0.06) > 0) {
+    ctx.fillStyle = '#e8e8f0';
+    ctx.font = `${Math.max(8, TILE*0.18)}px "Press Start 2P"`;
+    ctx.fillText('TAP or PRESS ANY KEY', cx, canvas.height * 0.78);
+  }
+
+  ctx.fillStyle = '#5a5a7a';
+  ctx.font = `${Math.max(6, TILE*0.13)}px "Press Start 2P"`;
+  ctx.fillText('Swipe or Arrow Keys to hop', cx, canvas.height * 0.86);
+  ctx.fillText('Reach Gate B7 · Avoid suitcases!', cx, canvas.height * 0.9);
+
+  ctx.textAlign = 'left';
+}
+
+function drawDeathOverlay() {
+  if (player.deathTimer < DEATH_ANIM) return;
+  const alpha = Math.min((player.deathTimer - DEATH_ANIM) / 40, 0.85);
+  ctx.fillStyle = `rgba(10, 8, 20, ${alpha})`;
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+  if (alpha > 0.4) {
+    ctx.textAlign = 'center';
+    ctx.fillStyle = '#ff6666';
+    ctx.font = `${Math.max(16, TILE*0.4)}px "Press Start 2P"`;
+    ctx.fillText('SPLAT!', canvas.width/2, canvas.height*0.38);
+
+    ctx.fillStyle = '#b0b0c8';
+    ctx.font = `${Math.max(9, TILE*0.2)}px "Press Start 2P"`;
+    ctx.fillText(`Made it ${player.maxRow} rows`, canvas.width/2, canvas.height*0.48);
+
+    if (Math.sin(gameTime * 0.06) > 0) {
+      ctx.fillStyle = '#e8e8f0';
+      ctx.font = `${Math.max(8, TILE*0.17)}px "Press Start 2P"`;
+      ctx.fillText('TAP TO RETRY', canvas.width/2, canvas.height*0.6);
+    }
+    ctx.textAlign = 'left';
+  }
+}
+
+function drawWinOverlay() {
+  const alpha = Math.min((gameTime - 0) * 0.02, 0.85);
+  ctx.fillStyle = `rgba(10, 20, 15, ${Math.min(alpha, 0.8)})`;
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+  ctx.textAlign = 'center';
+  ctx.fillStyle = '#66ffa8';
+  ctx.font = `${Math.max(18, TILE*0.45)}px "Press Start 2P"`;
+  ctx.fillText('BOARDING!', canvas.width/2, canvas.height*0.32);
+
+  ctx.fillStyle = '#ffd866';
+  ctx.font = `${Math.max(28, TILE*0.7)}px "Press Start 2P"`;
+  ctx.fillText('✈️', canvas.width/2, canvas.height*0.44);
+
+  ctx.fillStyle = '#b0d0c0';
+  ctx.font = `${Math.max(8, TILE*0.18)}px "Press Start 2P"`;
+  ctx.fillText('You made it to Gate B7!', canvas.width/2, canvas.height*0.54);
+
+  if (Math.sin(gameTime * 0.06) > 0) {
+    ctx.fillStyle = '#e8e8f0';
+    ctx.font = `${Math.max(8, TILE*0.17)}px "Press Start 2P"`;
+    ctx.fillText('TAP TO PLAY AGAIN', canvas.width/2, canvas.height*0.66);
+  }
+  ctx.textAlign = 'left';
+}
+
+// ── MAIN LOOP ──
+function render() {
+  const shakeX = screenShake > 0.5 ? (Math.random()-0.5)*screenShake : 0;
+  const shakeY = screenShake > 0.5 ? (Math.random()-0.5)*screenShake : 0;
+
+  ctx.save();
+  ctx.translate(shakeX, shakeY);
+
+  // Clear
+  ctx.fillStyle = '#1a1a2e';
+  ctx.fillRect(-5, -5, canvas.width+10, canvas.height+10);
+
+  // Draw lanes back to front
+  for (let i = TOTAL_ROWS - 1; i >= 0; i--) {
+    if (lanes[i]) drawLane(lanes[i]);
+  }
+
+  // Player
+  drawBun();
+
+  // Particles on top
+  for (const p of particles) {
+    ctx.globalAlpha = Math.max(0, p.life);
+    ctx.fillStyle = p.color;
+    const sx = p.x;
+    const sy = p.y - camY;
+    ctx.fillRect(sx - p.size/2, sy - p.size/2, p.size, p.size);
+  }
+  ctx.globalAlpha = 1;
+
+  // Flash
+  if (flashAlpha > 0.01) {
+    ctx.fillStyle = `rgba(255, 60, 60, ${flashAlpha})`;
+    ctx.fillRect(-5, -5, canvas.width+10, canvas.height+10);
+  }
+
+  ctx.restore();
+
+  // UI always stable (no shake)
+  if (gameState === 'playing' || gameState === 'dead') drawUI();
+  if (gameState === 'title') drawTitle();
+  if (gameState === 'dead') drawDeathOverlay();
+  if (gameState === 'win') drawWinOverlay();
+}
+
+function gameLoop() {
+  update();
+  if (gameState === 'dead') player.deathTimer++;
+  render();
+  requestAnimationFrame(gameLoop);
+}
+
+// Init with empty lanes for title screen bg
+generateLanes();
+gameLoop();
+</script>
+</body>
+</html>
